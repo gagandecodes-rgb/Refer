@@ -3,14 +3,12 @@ error_reporting(0);
 ini_set("display_errors", 0);
 
 /* ================= CONFIG ================= */
-define("POINTS_PER_WITHDRAW", 3);
-define("VERIFY_TOKEN_MINUTES", 10);
-define("TG_CONNECT_TIMEOUT", 2);
+define("POINTS_PER_COUPON", 3);
 define("TG_TIMEOUT", 6);
 
 /* ================= ENV ================= */
-$BOT_TOKEN    = getenv("BOT_TOKEN");
-$ADMIN_ID     = getenv("ADMIN_ID");
+$BOT_TOKEN = getenv("BOT_TOKEN");
+$ADMIN_ID  = getenv("ADMIN_ID");
 $BOT_USERNAME = getenv("BOT_USERNAME");
 
 $DB_HOST = getenv("DB_HOST");
@@ -20,45 +18,40 @@ $DB_USER = getenv("DB_USER");
 $DB_PASS = getenv("DB_PASS");
 
 if (!$BOT_TOKEN) { echo "OK"; exit; }
-$API = "https://api.telegram.org/bot{$BOT_TOKEN}";
+$API = "https://api.telegram.org/bot$BOT_TOKEN";
 
 /* ================= DB ================= */
 try {
   $pdo = new PDO(
     "pgsql:host=$DB_HOST;port=$DB_PORT;dbname=$DB_NAME;sslmode=require",
-    $DB_USER,
-    $DB_PASS,
+    $DB_USER, $DB_PASS,
     [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
   );
 } catch (Exception $e) {
   $pdo = null;
 }
-
-function dbReady(){ global $pdo; return $pdo instanceof PDO; }
+function db(){ global $pdo; return $pdo; }
 
 /* ================= TELEGRAM ================= */
 function tg($m,$d=[]){
   global $API;
-  $c=curl_init($API."/".$m);
+  $c = curl_init("$API/$m");
   curl_setopt_array($c,[
     CURLOPT_RETURNTRANSFER=>1,
     CURLOPT_POST=>1,
     CURLOPT_POSTFIELDS=>$d,
-    CURLOPT_CONNECTTIMEOUT=>TG_CONNECT_TIMEOUT,
     CURLOPT_TIMEOUT=>TG_TIMEOUT
   ]);
-  $r=curl_exec($c);
+  $r = curl_exec($c);
   curl_close($c);
-  return $r?json_decode($r,true):null;
+  return json_decode($r,true);
 }
-
 function sendMessage($id,$t,$k=null){
   $d=["chat_id"=>$id,"text"=>$t,"parse_mode"=>"HTML","disable_web_page_preview"=>true];
   if($k)$d["reply_markup"]=json_encode($k);
   tg("sendMessage",$d);
 }
-
-function answerCallback($id,$t="",$a=false){
+function answerCb($id,$t="",$a=false){
   tg("answerCallbackQuery",[
     "callback_query_id"=>$id,
     "text"=>$t,
@@ -67,10 +60,10 @@ function answerCallback($id,$t="",$a=false){
 }
 
 /* ================= HELPERS ================= */
-function isAdmin($id){ global $ADMIN_ID; return (string)$id===(string)$ADMIN_ID; }
-function normalizeChannel($c){ $c=trim($c); if($c && $c[0]!=="@")$c="@".$c; return $c; }
-function channel(){ return normalizeChannel(getenv("FORCE_JOIN_1")); }
+function isAdmin($id){ return (string)$id === (string)getenv("ADMIN_ID"); }
+function channel(){ return "@".ltrim(getenv("FORCE_JOIN_1"),"@"); }
 
+/* ================= UI ================= */
 function mainMenu($admin=false){
   $k=[
     [
@@ -79,111 +72,115 @@ function mainMenu($admin=false){
     ],
     [
       ["text"=>"🔗 My Referral Link","callback_data"=>"reflink"]
+    ],
+    [
+      ["text"=>"🏆 Leaderboard","callback_data"=>"leaderboard"]
     ]
   ];
-  if($admin)$k[]=[[ "text"=>"🛠 Admin Panel","callback_data"=>"admin" ]];
+  if($admin)$k[]=[[ "text"=>"🛠 Admin Panel","callback_data"=>"admin_panel" ]];
   return ["inline_keyboard"=>$k];
 }
 
 function joinMarkup(){
-  $ch=channel();
   return ["inline_keyboard"=>[
-    [[ "text"=>"✅ Join Channel","url"=>"https://t.me/".ltrim($ch,"@") ]],
+    [[ "text"=>"✅ Join Channel","url"=>"https://t.me/".ltrim(channel(),"@") ]],
     [[ "text"=>"✅ Check Verification","callback_data"=>"check_join" ]]
+  ]];
+}
+
+function adminPanel(){
+  return ["inline_keyboard"=>[
+    [
+      ["text"=>"➕ Add Coupon","callback_data"=>"admin_add"],
+      ["text"=>"➖ Remove Coupon","callback_data"=>"admin_remove"]
+    ],
+    [
+      ["text"=>"📦 Stock","callback_data"=>"admin_stock"],
+      ["text"=>"🗂 Redeems","callback_data"=>"admin_redeems"]
+    ],
+    [
+      ["text"=>"📢 Broadcast","callback_data"=>"admin_broadcast"]
+    ],
+    [
+      ["text"=>"⬅️ Back","callback_data"=>"back"]
+    ]
   ]];
 }
 
 /* ================= USERS ================= */
 function getUser($id){
-  global $pdo;
-  $s=$pdo->prepare("SELECT * FROM users WHERE tg_id=:i");
+  $s=db()->prepare("SELECT * FROM users WHERE tg_id=:i");
   $s->execute([":i"=>$id]);
   return $s->fetch(PDO::FETCH_ASSOC);
 }
-
-function upsertUser($id,$ref=null){
-  global $pdo;
-  $pdo->prepare(
+function addUser($id,$ref=null){
+  db()->prepare(
     "INSERT INTO users (tg_id,referred_by)
-     VALUES (:i,:r) ON CONFLICT (tg_id) DO NOTHING"
+     VALUES (:i,:r) ON CONFLICT DO NOTHING"
   )->execute([":i"=>$id,":r"=>$ref]);
 }
 
-function isVerified($id){
-  $u=getUser($id);
-  return $u && $u["verified"];
-}
-
 /* ================= JOIN CHECK ================= */
-function checkMember($uid,$chat){
-  $r=tg("getChatMember",["chat_id"=>$chat,"user_id"=>$uid]);
+function joined($uid){
+  $r=tg("getChatMember",["chat_id"=>channel(),"user_id"=>$uid]);
   return isset($r["result"]["status"]) &&
     in_array($r["result"]["status"],["member","administrator","creator"]);
 }
 
-/* ================= VERIFY LINK ================= */
-function baseUrl(){
-  $p="https";
-  if(!empty($_SERVER["HTTP_X_FORWARDED_PROTO"]))$p=$_SERVER["HTTP_X_FORWARDED_PROTO"];
-  $h=$_SERVER["HTTP_X_FORWARDED_HOST"]??$_SERVER["HTTP_HOST"];
-  return "$p://$h".$_SERVER["SCRIPT_NAME"];
-}
-
-function makeVerifyLink($uid){
-  global $pdo;
-  $t=bin2hex(random_bytes(16));
-  $pdo->prepare(
-    "UPDATE users SET verify_token=:t,
-     verify_token_expires=NOW()+INTERVAL '10 minutes'
-     WHERE tg_id=:i"
-  )->execute([":t"=>$t,":i"=>$uid]);
-  return baseUrl()."?mode=verify&uid=$uid&token=$t";
-}
-
-/* ================= WEBSITE VERIFY ================= */
-if($_SERVER["REQUEST_METHOD"]==="GET" && ($_GET["mode"]??"")==="verify"){
-  if(!$pdo){ echo "DB Error"; exit; }
-  $uid=(int)($_GET["uid"]??0);
-  $token=$_GET["token"]??"";
-  $step=$_GET["step"]??"";
-
-  if(!$step){
-    echo "<h2>Verify</h2><a href='?mode=verify&uid=$uid&token=$token&step=do'>Verify Now</a>";
-    exit;
-  }
-
-  $u=getUser($uid);
-  if(!$u || $u["verify_token"]!==$token){ echo "Invalid"; exit; }
-
-  $dt=$_COOKIE["device"]??bin2hex(random_bytes(16));
-  setcookie("device",$dt,time()+31536000,"/","",true,true);
-
-  $pdo->prepare(
-    "INSERT INTO device_links (device_token,tg_id)
-     VALUES (:d,:i)
-     ON CONFLICT (device_token) DO UPDATE SET tg_id=EXCLUDED.tg_id"
-  )->execute([":d"=>$dt,":i"=>$uid]);
-
-  $pdo->prepare(
-    "UPDATE users SET verified=true,verified_at=NOW(),
-     verify_token=NULL,verify_token_expires=NULL WHERE tg_id=:i"
-  )->execute([":i"=>$uid]);
-
-  header("Location: https://t.me/".ltrim($GLOBALS["BOT_USERNAME"],"@"));
-  exit;
-}
+/* ================= STATE (ADMIN) ================= */
+function stateFile($id){ return __DIR__."/state_$id.txt"; }
+function setState($id,$s){ file_put_contents(stateFile($id),$s); }
+function getState($id){ return file_exists(stateFile($id))?trim(file_get_contents(stateFile($id))):""; }
+function clearState($id){ @unlink(stateFile($id)); }
 
 /* ================= WEBHOOK ================= */
 $u=json_decode(file_get_contents("php://input"),true);
 if(!$u){ echo "OK"; exit; }
 
-/* ================= MESSAGES ================= */
+/* ================= MESSAGE ================= */
 if(isset($u["message"])){
   $m=$u["message"];
   $cid=$m["chat"]["id"];
   $uid=$m["from"]["id"];
   $t=trim($m["text"]??"");
 
+  /* ADMIN STATES */
+  if(isAdmin($uid)){
+    if(getState($uid)==="add_coupon"){
+      $codes=preg_split("/[\s,]+/",$t);
+      $added=0;
+      foreach($codes as $c){
+        if(!$c)continue;
+        try{
+          db()->prepare(
+            "INSERT INTO coupons (code,added_by) VALUES (:c,:a)"
+          )->execute([":c"=>$c,":a"=>$uid]);
+          $added++;
+        }catch(Exception $e){}
+      }
+      clearState($uid);
+      sendMessage($cid,"✅ Added <b>$added</b> coupons",adminPanel());
+      exit;
+    }
+    if(getState($uid)==="remove_coupon"){
+      db()->prepare("DELETE FROM coupons WHERE code=:c")
+        ->execute([":c"=>$t]);
+      clearState($uid);
+      sendMessage($cid,"🗑 Coupon removed (if existed)",adminPanel());
+      exit;
+    }
+    if(getState($uid)==="broadcast"){
+      $rows=db()->query("SELECT tg_id FROM users")->fetchAll();
+      foreach($rows as $r){
+        sendMessage($r["tg_id"],"📢 <b>Announcement</b>\n\n".$t);
+      }
+      clearState($uid);
+      sendMessage($cid,"📢 Broadcast sent",adminPanel());
+      exit;
+    }
+  }
+
+  /* START */
   if(strpos($t,"/start")===0){
     $ref=null;
     if(strpos($t," ")!==false){
@@ -192,25 +189,22 @@ if(isset($u["message"])){
     }
 
     if(!getUser($uid)){
-      upsertUser($uid,$ref);
+      addUser($uid,$ref);
       if($ref && $ref!=$uid){
-        $pdo->prepare(
-          "UPDATE users SET points=points+1,
-           total_referrals=total_referrals+1 WHERE tg_id=:r"
+        db()->prepare(
+          "UPDATE users SET points=points+1,total_referrals=total_referrals+1
+           WHERE tg_id=:r"
         )->execute([":r"=>$ref]);
       }
     }
 
-    if(isVerified($uid)){
+    if(joined($uid) || isAdmin($uid)){
       sendMessage($cid,"🎉 <b>Welcome!</b>",mainMenu(isAdmin($uid)));
     }else{
-      sendMessage($cid,"👉 Join channel then verify",joinMarkup());
+      sendMessage($cid,"👉 Join channel first",joinMarkup());
     }
     exit;
   }
-
-  sendMessage($cid,"Use /start");
-  exit;
 }
 
 /* ================= CALLBACKS ================= */
@@ -220,69 +214,112 @@ if(isset($u["callback_query"])){
   $uid=$c["from"]["id"];
   $d=$c["data"];
 
+  /* JOIN */
   if($d==="check_join"){
-    answerCallback($c["id"],"Checking...");
-    if(checkMember($uid,channel())){
-      $url=makeVerifyLink($uid);
-      sendMessage($cid,"🔐 Verify yourself",[
-        "inline_keyboard"=>[
-          [[ "text"=>"✅ Verify Now","url"=>$url ]],
-          [[ "text"=>"✅ Check Verification","callback_data"=>"check_verified" ]]
-        ]
-      ]);
+    answerCb($c["id"],"Checking...");
+    if(joined($uid) || isAdmin($uid)){
+      sendMessage($cid,"✅ Verified!",mainMenu(isAdmin($uid)));
     }else{
       sendMessage($cid,"❌ Join channel first",joinMarkup());
     }
     exit;
   }
 
-  if($d==="check_verified"){
-    if(isVerified($uid)){
-      sendMessage($cid,"✅ Verified!",mainMenu(isAdmin($uid)));
-    }else{
-      sendMessage($cid,"❌ Not verified yet");
+  /* ADMIN */
+  if($d==="admin_panel" && isAdmin($uid)){
+    answerCb($c["id"]);
+    sendMessage($cid,"🛠 <b>Admin Panel</b>",adminPanel());
+    exit;
+  }
+  if($d==="admin_add" && isAdmin($uid)){
+    setState($uid,"add_coupon");
+    sendMessage($cid,"➕ Send coupon codes",adminPanel());
+    exit;
+  }
+  if($d==="admin_remove" && isAdmin($uid)){
+    setState($uid,"remove_coupon");
+    sendMessage($cid,"➖ Send coupon code to remove",adminPanel());
+    exit;
+  }
+  if($d==="admin_broadcast" && isAdmin($uid)){
+    setState($uid,"broadcast");
+    sendMessage($cid,"📢 Send broadcast message",adminPanel());
+    exit;
+  }
+  if($d==="admin_stock" && isAdmin($uid)){
+    $a=db()->query("SELECT COUNT(*) FROM coupons WHERE used=false")->fetchColumn();
+    $u=db()->query("SELECT COUNT(*) FROM coupons WHERE used=true")->fetchColumn();
+    sendMessage($cid,"📦 Stock\n\n✅ Available: $a\n🧾 Used: $u",adminPanel());
+    exit;
+  }
+  if($d==="admin_redeems" && isAdmin($uid)){
+    $r=db()->query(
+      "SELECT tg_id,coupon_code,created_at FROM withdrawals ORDER BY id DESC LIMIT 10"
+    )->fetchAll();
+    $t="🗂 <b>Last Redeems</b>\n\n";
+    foreach($r as $x){
+      $t.="👤 {$x['tg_id']}\n🎟 {$x['coupon_code']}\n🕒 {$x['created_at']}\n\n";
     }
+    sendMessage($cid,$t ?: "No redeems",adminPanel());
+    exit;
+  }
+  if($d==="back"){
+    sendMessage($cid,"🏠 Main Menu",mainMenu(isAdmin($uid)));
     exit;
   }
 
-  if(!isVerified($uid)){
-    answerCallback($c["id"],"Verify first",true);
-    exit;
-  }
-
+  /* USER */
   if($d==="stats"){
     $u=getUser($uid);
-    sendMessage($cid,"⭐ Points: {$u['points']}\n👥 Referrals: {$u['total_referrals']}",mainMenu(isAdmin($uid)));
+    sendMessage($cid,
+      "⭐ Points: <b>{$u['points']}</b>\n👥 Referrals: <b>{$u['total_referrals']}</b>\n\n🎁 3 points = 1 coupon",
+      mainMenu(isAdmin($uid))
+    );
     exit;
   }
 
   if($d==="reflink"){
-    $link="https://t.me/{$BOT_USERNAME}?start=$uid";
-    sendMessage($cid,"🔗 <code>$link</code>",mainMenu(isAdmin($uid)));
+    sendMessage($cid,"🔗 <code>https://t.me/$BOT_USERNAME?start=$uid</code>",mainMenu(isAdmin($uid)));
+    exit;
+  }
+
+  if($d==="leaderboard"){
+    $rows=db()->query(
+      "SELECT tg_id,total_referrals FROM users
+       ORDER BY total_referrals DESC LIMIT 10"
+    )->fetchAll();
+    $t="🏆 <b>Top 10 Referrers</b>\n\n";
+    $i=1;
+    foreach($rows as $r){
+      $t.="$i️⃣ <code>{$r['tg_id']}</code> — {$r['total_referrals']}\n";
+      $i++;
+    }
+    sendMessage($cid,$t,mainMenu(isAdmin($uid)));
     exit;
   }
 
   if($d==="withdraw"){
     $u=getUser($uid);
-    if($u["points"]<3){
+    if($u["points"]<POINTS_PER_COUPON){
       sendMessage($cid,"❌ Need 3 points",mainMenu(isAdmin($uid)));
       exit;
     }
 
-    $pdo->beginTransaction();
-    $coup=$pdo->query("SELECT * FROM coupons WHERE used=false LIMIT 1 FOR UPDATE")->fetch();
-    if(!$coup){ $pdo->rollBack(); sendMessage($cid,"Out of stock"); exit; }
+    db()->beginTransaction();
+    $coup=db()->query("SELECT * FROM coupons WHERE used=false LIMIT 1 FOR UPDATE")->fetch();
+    if(!$coup){ db()->rollBack(); sendMessage($cid,"Out of stock"); exit; }
 
-    $pdo->prepare("UPDATE users SET points=points-3 WHERE tg_id=:i")->execute([":i"=>$uid]);
-    $pdo->prepare("UPDATE coupons SET used=true,used_by=:i,used_at=NOW() WHERE id=:id")
-        ->execute([":i"=>$uid,":id"=>$coup["id"]]);
-    $pdo->prepare("INSERT INTO withdrawals (tg_id,coupon_code,points_deducted)
-                   VALUES (:i,:c,3)")
-        ->execute([":i"=>$uid,":c"=>$coup["code"]]);
-    $pdo->commit();
+    db()->prepare("UPDATE users SET points=points-3 WHERE tg_id=:i")->execute([":i"=>$uid]);
+    db()->prepare("UPDATE coupons SET used=true,used_by=:i,used_at=NOW() WHERE id=:id")
+      ->execute([":i"=>$uid,":id"=>$coup["id"]]);
+    db()->prepare(
+      "INSERT INTO withdrawals (tg_id,coupon_code,points_deducted)
+       VALUES (:i,:c,3)"
+    )->execute([":i"=>$uid,":c"=>$coup["code"]]);
+    db()->commit();
 
-    sendMessage($cid,"🎉 Coupon:\n<code>{$coup['code']}</code>",mainMenu(isAdmin($uid)));
-    sendMessage($ADMIN_ID,"Coupon redeemed by $uid\n{$coup['code']}");
+    sendMessage($cid,"🎉 <b>Your Coupon</b>\n<code>{$coup['code']}</code>",mainMenu(isAdmin($uid)));
+    sendMessage($ADMIN_ID,"✅ Coupon redeemed by $uid\n{$coup['code']}");
     exit;
   }
 }
