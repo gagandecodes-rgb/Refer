@@ -6,11 +6,12 @@ ini_set("display_errors", 0);
 define("POINTS_PER_COUPON", 3);
 define("TG_TIMEOUT", 6);
 
-/* ================= HELPERS ================= */
+/* ================= ALWAYS OK ================= */
 function finish_ok() { http_response_code(200); echo "OK"; exit; }
 
+/* ================= URL HELPERS ================= */
 function baseUrl() {
-  $proto = $_SERVER["HTTP_X_FORWARDED_PROTO"] ?? ( (!empty($_SERVER["HTTPS"]) && $_SERVER["HTTPS"]!=="off") ? "https" : "http" );
+  $proto = $_SERVER["HTTP_X_FORWARDED_PROTO"] ?? ((!empty($_SERVER["HTTPS"]) && $_SERVER["HTTPS"] !== "off") ? "https" : "http");
   $host  = $_SERVER["HTTP_X_FORWARDED_HOST"] ?? $_SERVER["HTTP_HOST"];
   $path  = strtok($_SERVER["REQUEST_URI"], "?"); // /index.php
   return $proto . "://" . $host . $path;
@@ -20,7 +21,6 @@ function baseUrl() {
 $BOT_TOKEN    = getenv("BOT_TOKEN");
 $ADMIN_ID     = getenv("ADMIN_ID");
 $BOT_USERNAME = getenv("BOT_USERNAME");
-$FORCE_JOIN_1 = getenv("FORCE_JOIN_1");
 
 $DB_HOST = getenv("DB_HOST");
 $DB_PORT = getenv("DB_PORT") ?: "5432";
@@ -56,6 +56,7 @@ function tg($method, $data = []) {
   curl_close($ch);
   return $res ? json_decode($res, true) : null;
 }
+
 function sendMessage($chat_id, $text, $markup=null){
   $data = [
     "chat_id"=>$chat_id,
@@ -66,6 +67,7 @@ function sendMessage($chat_id, $text, $markup=null){
   if($markup) $data["reply_markup"] = json_encode($markup);
   tg("sendMessage",$data);
 }
+
 function answerCb($id,$text="",$alert=false){
   tg("answerCallbackQuery",[
     "callback_query_id"=>$id,
@@ -84,9 +86,11 @@ function forceChannel() {
   if ($ch && $ch[0] !== "@") $ch = "@".$ch;
   return $ch;
 }
+
 function joinedChannel($uid){
   $ch = forceChannel();
   if(!$ch) return true;
+
   $r = tg("getChatMember",["chat_id"=>$ch,"user_id"=>$uid]);
   if(!$r || empty($r["ok"])) return false;
   $s = $r["result"]["status"] ?? "";
@@ -94,29 +98,34 @@ function joinedChannel($uid){
 }
 
 /* ================= DB: USERS ================= */
-function ensureUser($uid, $ref=null){
-  $pdo = db(); if(!$pdo) return;
-  $pdo->prepare("INSERT INTO users (tg_id,referred_by) VALUES (:i,:r) ON CONFLICT (tg_id) DO NOTHING")
-      ->execute([":i"=>$uid,":r"=>$ref]);
+function ensureUserNoRef($uid){
+  $pdo=db(); if(!$pdo) return;
+  $pdo->prepare("INSERT INTO users (tg_id) VALUES (:i) ON CONFLICT (tg_id) DO NOTHING")
+      ->execute([":i"=>$uid]);
 }
+
 function getUser($uid){
   $pdo=db(); if(!$pdo) return null;
   $st=$pdo->prepare("SELECT * FROM users WHERE tg_id=:i");
   $st->execute([":i"=>$uid]);
   return $st->fetch(PDO::FETCH_ASSOC) ?: null;
 }
+
 function isVerified($uid){
   $u=getUser($uid);
   return $u && !empty($u["verified"]);
 }
+
 function setVerified($uid){
   $pdo=db(); if(!$pdo) return;
   $pdo->prepare("UPDATE users SET verified=true WHERE tg_id=:i")->execute([":i"=>$uid]);
 }
+
 function setAdminState($uid,$state){
   $pdo=db(); if(!$pdo) return;
   $pdo->prepare("UPDATE users SET admin_state=:s WHERE tg_id=:i")->execute([":s"=>$state,":i"=>$uid]);
 }
+
 function getAdminState($uid){
   $u=getUser($uid);
   return $u ? trim((string)($u["admin_state"] ?? "")) : "";
@@ -184,7 +193,7 @@ if ($_SERVER["REQUEST_METHOD"] === "GET" && ($_GET["mode"] ?? "") === "verify") 
   $uid = (int)($_GET["uid"] ?? 0);
 
   if ($uid > 0 && db()) {
-    // mark verified immediately (simple + stable)
+    ensureUserNoRef($uid);
     setVerified($uid);
   }
 
@@ -233,11 +242,9 @@ if(isset($update["message"])) {
   $uid = $m["from"]["id"];
   $text = trim($m["text"] ?? "");
 
-  // Ensure user exists always
-  ensureUser($uid, null);
-
-  // Admin "states" (add/remove/broadcast) as messages
+  /* ADMIN STATE INPUTS */
   if (isAdmin($uid) && db()) {
+    ensureUserNoRef($uid);
     $state = getAdminState($uid);
 
     if ($state === "add") {
@@ -276,22 +283,37 @@ if(isset($update["message"])) {
     }
   }
 
-  // /start with referral
+  /* /start with referral (FIXED) */
   if (strpos($text, "/start") === 0) {
+
+    // parse ref id
     $ref = null;
     if (strpos($text, " ") !== false) {
       [, $p] = explode(" ", $text, 2);
       if (ctype_digit($p)) $ref = (int)$p;
     }
 
-    // first time create with referred_by
-    $u = getUser($uid);
-    if (!$u && db()) {
-      ensureUser($uid, $ref);
-      // give point to referrer ONLY if valid and not self
-      if ($ref && $ref != $uid) {
-        db()->prepare("UPDATE users SET points=points+1,total_referrals=total_referrals+1 WHERE tg_id=:r")
-           ->execute([":r"=>$ref]);
+    // Insert user ONLY here and detect first-time insert
+    $isNew = false;
+    if (db()) {
+      $stmt = db()->prepare(
+        "INSERT INTO users (tg_id, referred_by)
+         VALUES (:i, :r)
+         ON CONFLICT (tg_id) DO NOTHING
+         RETURNING tg_id"
+      );
+      $stmt->execute([":i"=>$uid, ":r"=>$ref]);
+      $row = $stmt->fetch(PDO::FETCH_ASSOC);
+      $isNew = (bool)$row;
+
+      // award ref ONLY if new user
+      if ($isNew && $ref && $ref != $uid) {
+        db()->prepare(
+          "UPDATE users
+           SET points = points + 1,
+               total_referrals = total_referrals + 1
+           WHERE tg_id = :r"
+        )->execute([":r"=>$ref]);
       }
     }
 
@@ -301,9 +323,12 @@ if(isset($update["message"])) {
     } else {
       sendMessage($cid, "👉 Join channel then verify", joinMarkup());
     }
+
     finish_ok();
   }
 
+  // other messages: do nothing, but ensure user exists (no referral)
+  ensureUserNoRef($uid);
   finish_ok();
 }
 
@@ -314,7 +339,7 @@ if(isset($update["callback_query"])) {
   $uid = $cq["from"]["id"];
   $data = $cq["data"] ?? "";
 
-  ensureUser($uid, null);
+  ensureUserNoRef($uid);
 
   // check join
   if ($data === "check_join") {
@@ -345,21 +370,42 @@ if(isset($update["callback_query"])) {
     finish_ok();
   }
 
-  // user actions
+  // stats
   if ($data === "stats") {
     $u = getUser($uid);
     $points = (int)($u["points"] ?? 0);
     $refs   = (int)($u["total_referrals"] ?? 0);
-    sendMessage($cid, "📊 <b>Your Stats</b>\n\n⭐ Points: <b>$points</b>\n👥 Referrals: <b>$refs</b>\n\n🎁 Need <b>".POINTS_PER_COUPON."</b> points per coupon.", mainMenu(isAdmin($uid)));
+    $ver    = !empty($u["verified"]) ? "✅ Yes" : "❌ No";
+
+    $redeems = 0;
+    if (db()) {
+      $st = db()->prepare("SELECT COUNT(*) FROM withdrawals WHERE tg_id=:i");
+      $st->execute([":i"=>$uid]);
+      $redeems = (int)$st->fetchColumn();
+    }
+
+    sendMessage(
+      $cid,
+      "📊 <b>Your Stats</b>\n\n".
+      "⭐ Points: <b>$points</b>\n".
+      "👥 Referrals: <b>$refs</b>\n".
+      "🎟 Redeemed: <b>$redeems</b>\n".
+      "🔐 Verified: <b>$ver</b>\n\n".
+      "🎁 Need <b>".POINTS_PER_COUPON."</b> points per coupon.",
+      mainMenu(isAdmin($uid))
+    );
     finish_ok();
   }
 
+  // referral link
   if ($data === "reflink") {
-    $link = "https://t.me/".ltrim($GLOBALS["BOT_USERNAME"],"@")."?start=".$uid;
+    $bn = ltrim((string)$GLOBALS["BOT_USERNAME"], "@");
+    $link = $bn ? ("https://t.me/".$bn."?start=".$uid) : "Set BOT_USERNAME in Render ENV";
     sendMessage($cid, "🔗 <b>Your Referral Link</b>\n<code>$link</code>", mainMenu(isAdmin($uid)));
     finish_ok();
   }
 
+  // leaderboard
   if ($data === "leaderboard") {
     $rows = db()->query("SELECT tg_id,total_referrals FROM users ORDER BY total_referrals DESC LIMIT 10")->fetchAll(PDO::FETCH_ASSOC);
     $txt = "🏆 <b>Top 10 Referrers</b>\n\n";
@@ -372,6 +418,7 @@ if(isset($update["callback_query"])) {
     finish_ok();
   }
 
+  // redeem
   if ($data === "redeem") {
     $u = getUser($uid);
     $points = (int)($u["points"] ?? 0);
@@ -402,32 +449,37 @@ if(isset($update["callback_query"])) {
     finish_ok();
   }
 
-  // admin panel
+  /* ================= ADMIN PANEL ================= */
   if ($data === "admin_panel" && isAdmin($uid)) {
     sendMessage($cid, "🛠 <b>Admin Panel</b>", adminPanel());
     finish_ok();
   }
+
   if ($data === "admin_add" && isAdmin($uid)) {
     setAdminState($uid, "add");
     sendMessage($cid, "➕ Send coupon codes (space / new line / comma).", adminPanel());
     finish_ok();
   }
+
   if ($data === "admin_remove" && isAdmin($uid)) {
     setAdminState($uid, "remove");
     sendMessage($cid, "➖ Send the coupon code to remove.", adminPanel());
     finish_ok();
   }
+
   if ($data === "admin_broadcast" && isAdmin($uid)) {
     setAdminState($uid, "broadcast");
     sendMessage($cid, "📢 Send broadcast message (will go to ALL users).", adminPanel());
     finish_ok();
   }
+
   if ($data === "admin_stock" && isAdmin($uid)) {
     $a = (int)db()->query("SELECT COUNT(*) FROM coupons WHERE used=false")->fetchColumn();
     $u = (int)db()->query("SELECT COUNT(*) FROM coupons WHERE used=true")->fetchColumn();
     sendMessage($cid, "📦 <b>Stock</b>\n\n✅ Available: <b>$a</b>\n🧾 Used: <b>$u</b>", adminPanel());
     finish_ok();
   }
+
   if ($data === "admin_redeems" && isAdmin($uid)) {
     $rows = db()->query("SELECT tg_id,coupon_code,created_at FROM withdrawals ORDER BY id DESC LIMIT 10")->fetchAll(PDO::FETCH_ASSOC);
     $txt = "🗂 <b>Last 10 Redeems</b>\n\n";
@@ -438,12 +490,12 @@ if(isset($update["callback_query"])) {
     sendMessage($cid, $txt, adminPanel());
     finish_ok();
   }
+
   if ($data === "back_main") {
     sendMessage($cid, "🏠 Main Menu", mainMenu(true));
     finish_ok();
   }
 
-  // unknown callback
   answerCb($cq["id"], "");
   finish_ok();
 }
